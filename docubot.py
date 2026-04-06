@@ -9,6 +9,13 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+
+def _tokenize(text):
+    """Lowercase alphanumeric tokens (letters, digits, underscores)."""
+    return re.findall(r"[a-z0-9_]+", text.lower())
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -50,7 +57,6 @@ class DocuBot:
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
         Build a tiny inverted index mapping lowercase words to the documents
         they appear in.
 
@@ -60,11 +66,15 @@ class DocuBot:
             "database": ["DATABASE.md"]
         }
 
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Tokens are alphanumeric chunks; each filename is listed once per token.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for tok in set(_tokenize(text)):
+                if tok not in index:
+                    index[tok] = []
+                if filename not in index[tok]:
+                    index[tok].append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +83,40 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Simple relevance: count how many distinct query tokens appear in the text.
         """
-        # TODO: implement scoring
-        return 0
+        q_words = _tokenize(query)
+        if not q_words:
+            return 0
+        text_tokens = set(_tokenize(text))
+        return sum(1 for w in q_words if w in text_tokens)
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        Use the index to narrow candidate documents, score each, return top_k
+        (filename, full document text) by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        q_words = _tokenize(query)
+        if not q_words:
+            return []
+
+        candidates = set()
+        for w in q_words:
+            for fn in self.index.get(w, []):
+                candidates.add(fn)
+
+        if not candidates:
+            candidates = {fn for fn, _ in self.documents}
+
+        doc_map = {fn: t for fn, t in self.documents}
+        scored = []
+        for fn in candidates:
+            text = doc_map[fn]
+            s = self.score_document(query, text)
+            scored.append((s, fn, text))
+
+        scored.sort(key=lambda x: -x[0])
+        return [(fn, text) for s, fn, text in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes

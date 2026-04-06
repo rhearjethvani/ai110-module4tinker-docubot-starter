@@ -18,6 +18,9 @@ def _tokenize(text):
 
 
 class DocuBot:
+    # Refuse retrieval when no chunk reaches this overlap score (distinct query terms matched).
+    min_retrieval_score = 1
+
     def __init__(self, docs_folder="docs", llm_client=None):
         """
         docs_folder: directory containing project documentation files
@@ -29,8 +32,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Paragraph-level chunks for tighter snippets (Phase 3)
+        self.chunks = self._build_chunks(self.documents)
+
+        # Inverted index: token -> list of chunk indices
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -51,30 +57,45 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def _split_into_chunks(self, filename, text):
+        """
+        Split on blank lines into paragraph-like units. Small fragments are merged
+        into the whole file as one chunk when needed so short docs still retrieve.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return []
+        parts = re.split(r"\n\s*\n+", stripped)
+        chunks = []
+        for p in parts:
+            p = p.strip()
+            if len(p) >= 40:
+                chunks.append((filename, p))
+        if not chunks:
+            chunks.append((filename, stripped))
+        return chunks
+
+    def _build_chunks(self, documents):
+        out = []
+        for filename, text in documents:
+            out.extend(self._split_into_chunks(filename, text))
+        return out
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def build_index(self, chunks):
         """
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to chunk indices.
 
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Tokens are alphanumeric chunks; each filename is listed once per token.
+        chunks is a list of (filename, text). The index maps each token to the
+        indices of chunks where that token appears at least once.
         """
         index = {}
-        for filename, text in documents:
+        for i, (_, text) in enumerate(chunks):
             for tok in set(_tokenize(text)):
-                if tok not in index:
-                    index[tok] = []
-                if filename not in index[tok]:
-                    index[tok].append(filename)
+                index.setdefault(tok, []).append(i)
         return index
 
     # -----------------------------------------------------------
@@ -93,30 +114,46 @@ class DocuBot:
 
     def retrieve(self, query, top_k=3):
         """
-        Use the index to narrow candidate documents, score each, return top_k
-        (filename, full document text) by score descending.
+        Narrow to chunks that match any query token, score by query-term overlap,
+        return top_k (filename, chunk text). Empty when best score is below
+        min_retrieval_score (guardrail).
         """
         q_words = _tokenize(query)
         if not q_words:
             return []
 
-        candidates = set()
+        candidate_indices = set()
         for w in q_words:
-            for fn in self.index.get(w, []):
-                candidates.add(fn)
+            for i in self.index.get(w, []):
+                candidate_indices.add(i)
 
-        if not candidates:
-            candidates = {fn for fn, _ in self.documents}
+        if not candidate_indices:
+            candidate_indices = set(range(len(self.chunks)))
 
-        doc_map = {fn: t for fn, t in self.documents}
         scored = []
-        for fn in candidates:
-            text = doc_map[fn]
+        for i in candidate_indices:
+            fn, text = self.chunks[i]
             s = self.score_document(query, text)
-            scored.append((s, fn, text))
+            scored.append((s, i, fn, text))
 
-        scored.sort(key=lambda x: -x[0])
-        return [(fn, text) for s, fn, text in scored[:top_k]]
+        scored.sort(key=lambda x: (-x[0], x[1]))
+
+        if not scored or scored[0][0] < self.min_retrieval_score:
+            return []
+
+        results = []
+        seen = set()
+        for s, _i, fn, text in scored:
+            if s < self.min_retrieval_score:
+                break
+            key = (fn, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append((fn, text))
+            if len(results) >= top_k:
+                break
+        return results
 
     # -----------------------------------------------------------
     # Answering Modes

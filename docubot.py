@@ -17,6 +17,146 @@ def _tokenize(text):
     return re.findall(r"[a-z0-9_]+", text.lower())
 
 
+# Common words that hurt ranking when every chunk matches them equally.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "it",
+        "this",
+        "that",
+        "these",
+        "those",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "where",
+        "when",
+        "why",
+        "how",
+        "do",
+        "does",
+        "did",
+        "any",
+        "all",
+        "each",
+        "every",
+        "both",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "nor",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "can",
+        "will",
+        "just",
+        "should",
+        "now",
+        "i",
+        "you",
+        "he",
+        "she",
+        "we",
+        "they",
+        "me",
+        "him",
+        "her",
+        "us",
+        "them",
+        "my",
+        "your",
+        "its",
+        "our",
+        "their",
+        "and",
+        "or",
+        "but",
+        "if",
+        "there",
+        "here",
+        "into",
+        "over",
+        "after",
+        "before",
+        "about",
+        "against",
+        "between",
+        "through",
+        "during",
+        "without",
+        "within",
+        "must",
+        "may",
+        "might",
+    }
+)
+
+
+def _query_content_tokens(query):
+    """Drop stopwords so scores reflect content terms (auth, token, users, …)."""
+    raw = _tokenize(query)
+    content = [w for w in raw if w not in _STOPWORDS and len(w) > 2]
+    return content if content else raw
+
+
+def _expanded_token_set(text):
+    """
+    Tokens in text plus underscore-split parts so auth_utils matches query "auth"
+    and generate_access_token matches "generate" / prefix overlap.
+    """
+    s = set()
+    for t in _tokenize(text):
+        s.add(t)
+        if "_" in t:
+            for part in t.split("_"):
+                if part:
+                    s.add(part)
+    return s
+
+
+def _token_matches_chunk_term(query_tok, expanded_chunk_tokens):
+    if query_tok in expanded_chunk_tokens:
+        return True
+    if len(query_tok) < 5:
+        return False
+    pref = query_tok[:5]
+    for t in expanded_chunk_tokens:
+        if len(t) >= 5 and (t.startswith(pref) or query_tok.startswith(t[:5])):
+            return True
+    return False
+
+
 class DocuBot:
     # Refuse retrieval when no chunk reaches this overlap score (distinct query terms matched).
     min_retrieval_score = 1
@@ -94,8 +234,10 @@ class DocuBot:
         """
         index = {}
         for i, (_, text) in enumerate(chunks):
-            for tok in set(_tokenize(text)):
+            for tok in _expanded_token_set(text):
                 index.setdefault(tok, []).append(i)
+                if len(tok) >= 5:
+                    index.setdefault(tok[:5], []).append(i)
         return index
 
     # -----------------------------------------------------------
@@ -104,13 +246,22 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        Simple relevance: count how many distinct query tokens appear in the text.
+        Score by content-query overlap against expanded chunk tokens, with light
+        prefix matching (e.g. generated ↔ generation) and a small boost when the
+        chunk names the token generator and the query is about generation.
         """
-        q_words = _tokenize(query)
+        q_words = _query_content_tokens(query)
         if not q_words:
             return 0
-        text_tokens = set(_tokenize(text))
-        return sum(1 for w in q_words if w in text_tokens)
+        ts = _expanded_token_set(text)
+        base = sum(1 for w in q_words if _token_matches_chunk_term(w, ts))
+        if base == 0:
+            return 0
+        if any(w.startswith("generat") for w in q_words) and (
+            "generate_access_token" in text or "generate_access_token" in ts
+        ):
+            base += 2
+        return base
 
     def retrieve(self, query, top_k=3):
         """
@@ -118,7 +269,7 @@ class DocuBot:
         return top_k (filename, chunk text). Empty when best score is below
         min_retrieval_score (guardrail).
         """
-        q_words = _tokenize(query)
+        q_words = _query_content_tokens(query)
         if not q_words:
             return []
 
@@ -126,6 +277,9 @@ class DocuBot:
         for w in q_words:
             for i in self.index.get(w, []):
                 candidate_indices.add(i)
+            if len(w) >= 5:
+                for i in self.index.get(w[:5], []):
+                    candidate_indices.add(i)
 
         if not candidate_indices:
             candidate_indices = set(range(len(self.chunks)))
@@ -136,15 +290,22 @@ class DocuBot:
             s = self.score_document(query, text)
             scored.append((s, i, fn, text))
 
-        scored.sort(key=lambda x: (-x[0], x[1]))
+        # Prefer higher score, then shorter snippets (more focused than huge API tables).
+        scored.sort(key=lambda x: (-x[0], len(x[3]), x[1]))
 
-        if not scored or scored[0][0] < self.min_retrieval_score:
+        # Weak match: one generic token (e.g. "docs") is not enough when the user
+        # asked several content words (e.g. payment + processing + mention).
+        min_needed = self.min_retrieval_score
+        if len(q_words) >= 3:
+            min_needed = max(min_needed, 2)
+
+        if not scored or scored[0][0] < min_needed:
             return []
 
         results = []
         seen = set()
         for s, _i, fn, text in scored:
-            if s < self.min_retrieval_score:
+            if s < min_needed:
                 break
             key = (fn, text)
             if key in seen:
